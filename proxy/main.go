@@ -30,6 +30,26 @@ func startListener() {
 		go handleConnection(conn)
 	}
 }
+func handleHTTPS(conn net.Conn, connReader *bufio.Reader, r *http.Request) {
+	//host := r.Host
+	//port := r.URL.Port()
+	conn2, err := net.Dial("tcp", r.URL.Host)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	conn.Write([]byte("HTTP/1.0 200 Connection established\r\n\r\n"))
+	io.Copy(conn2, conn)
+
+	/*r.Write(conn2)
+	reader2 := bufio.NewReader(conn2)
+	if err != nil {
+		return
+	}
+	resp, _ := io.ReadAll(reader2)
+	fmt.Println(string(resp))*/
+	return
+}
 
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
@@ -37,6 +57,10 @@ func handleConnection(conn net.Conn) {
 	request, err := http.ReadRequest(reader)
 	if err != nil {
 		log.Println(err)
+		return
+	}
+	if request.Method == "CONNECT" {
+		handleHTTPS(conn, reader, request)
 		return
 	}
 
@@ -64,5 +88,7 @@ func handleConnection(conn net.Conn) {
 }
 
 func main() {
+	//certs.CreateCA()
+
 	startListener()
 }
