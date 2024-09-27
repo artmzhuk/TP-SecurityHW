@@ -1,20 +1,24 @@
-package certs
+package cert
 
 import (
 	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
-	"net"
 	"os"
+	"strings"
 	"time"
 )
 
-func CreateCA() error {
+type CertificateWithPrivate struct {
+	Certificate *x509.Certificate
+	PrivateKey  *rsa.PrivateKey
+}
+
+func CreateCA(folder string) (CertificateWithPrivate, error) {
 	ca := &x509.Certificate{
 		SerialNumber: big.NewInt(2024),
 		Subject: pkix.Name{
@@ -36,13 +40,13 @@ func CreateCA() error {
 	// create our private and public key
 	caPrivKey, err := rsa.GenerateKey(rand.Reader, 4096)
 	if err != nil {
-		return err
+		return CertificateWithPrivate{}, err
 	}
 
 	// create the CA
 	caBytes, err := x509.CreateCertificate(rand.Reader, ca, ca, &caPrivKey.PublicKey, caPrivKey)
 	if err != nil {
-		return err
+		return CertificateWithPrivate{}, err
 	}
 
 	// pem encode
@@ -57,39 +61,76 @@ func CreateCA() error {
 		Type:  "RSA PRIVATE KEY",
 		Bytes: x509.MarshalPKCS1PrivateKey(caPrivKey),
 	})
-	caFile, err := os.Create("proxy/certs/ca.crt")
+	caFile, err := os.Create(folder + "/ca.crt")
 	defer caFile.Close()
 	if err != nil {
-		return err
+		return CertificateWithPrivate{}, err
 	}
 	caPEM.WriteTo(caFile)
-	return nil
+
+	caPrivFile, err := os.Create(folder + "/ca-PRIVATE.key")
+	defer caPrivFile.Close()
+	if err != nil {
+		return CertificateWithPrivate{}, err
+	}
+	caPrivKeyPEM.WriteTo(caPrivFile)
+
+	cert := CertificateWithPrivate{
+		Certificate: ca,
+		PrivateKey:  caPrivKey,
+	}
+
+	return cert, nil
 }
 
-func OpenCa() {
+func OpenCert(path string) (CertificateWithPrivate, error) {
+	caByte, err := os.ReadFile(path + ".crt")
+	if err != nil {
+		return CertificateWithPrivate{}, err
+	}
+	pemCA, _ := pem.Decode(caByte)
+
+	ca, err := x509.ParseCertificate(pemCA.Bytes)
+	if err != nil {
+		return CertificateWithPrivate{}, err
+	}
+
+	privateByte, err := os.ReadFile(path + "-PRIVATE.key")
+	if err != nil {
+		return CertificateWithPrivate{}, err
+	}
+	pemPrivate, _ := pem.Decode(privateByte)
+	key, err := x509.ParsePKCS1PrivateKey(pemPrivate.Bytes)
+	if err != nil {
+		return CertificateWithPrivate{}, err
+	}
+	return CertificateWithPrivate{
+		Certificate: ca,
+		PrivateKey:  key,
+	}, nil
 
 }
 
-func CreateCert(name string, ca *x509.Certificate) error {
+func CreateCert(host string, ca CertificateWithPrivate, folder string) (CertificateWithPrivate, error) {
 	cert := &x509.Certificate{
 		SerialNumber: big.NewInt(2024),
 		Subject: pkix.Name{
-			CommonName: name,
+			CommonName: strings.ReplaceAll(host, "-", "."),
 		},
-		NotBefore:    time.Now(),
-		NotAfter:     time.Now().AddDate(10, 0, 0),
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
-		KeyUsage:     x509.KeyUsageDigitalSignature,
+		NotBefore:   time.Now(),
+		NotAfter:    time.Now().AddDate(10, 0, 0),
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+		KeyUsage:    x509.KeyUsageDigitalSignature,
 	}
 
 	certPrivKey, err := rsa.GenerateKey(rand.Reader, 4096)
 	if err != nil {
-		return err
-	},
+		return CertificateWithPrivate{}, nil
+	}
 
-	certBytes, err := x509.CreateCertificate(rand.Reader, cert, ca, &certPrivKey.PublicKey, caPrivKey)
+	certBytes, err := x509.CreateCertificate(rand.Reader, cert, ca.Certificate, &certPrivKey.PublicKey, ca.PrivateKey)
 	if err != nil {
-		return err
+		return CertificateWithPrivate{}, nil
 	}
 
 	certPEM := new(bytes.Buffer)
@@ -98,18 +139,32 @@ func CreateCert(name string, ca *x509.Certificate) error {
 		Bytes: certBytes,
 	})
 
+	nameReplaced := strings.ReplaceAll(host, ".", "-")
+	certFile, err := os.Create(folder + "/" + nameReplaced + ".crt")
+	defer certFile.Close()
+	if err != nil {
+		return CertificateWithPrivate{}, nil
+	}
+	certPEM.WriteTo(certFile)
+
 	certPrivKeyPEM := new(bytes.Buffer)
 	pem.Encode(certPrivKeyPEM, &pem.Block{
 		Type:  "RSA PRIVATE KEY",
 		Bytes: x509.MarshalPKCS1PrivateKey(certPrivKey),
 	})
+	certPrivFile, err := os.Create(folder + "/" + nameReplaced + "-PRIVATE.key")
+	defer certPrivFile.Close()
+	if err != nil {
+		return CertificateWithPrivate{}, nil
+	}
+	certPrivKeyPEM.WriteTo(certPrivFile)
 
-	serverCert, err := tls.X509KeyPair(certPEM.Bytes(), certPrivKeyPEM.Bytes())
+	/*serverCert, err := tls.X509KeyPair(certPEM.Bytes(), certPrivKeyPEM.Bytes())
 	if err != nil {
 		return err
 	}
 
-	/*serverTLSConf = &tls.Config{
+	serverTLSConf = &tls.Config{
 		Certificates: []tls.Certificate{serverCert},
 	}
 
@@ -119,10 +174,13 @@ func CreateCert(name string, ca *x509.Certificate) error {
 		RootCAs: certpool,
 	}*/
 
-	return
+	return CertificateWithPrivate{
+		Certificate: cert,
+		PrivateKey:  certPrivKey,
+	}, nil
 }
 
-func certsetup() (serverTLSConf *tls.Config, clientTLSConf *tls.Config, err error) {
+/*func certsetup() (serverTLSConf *tls.Config, clientTLSConf *tls.Config, err error) {
 	// set up our CA certificate
 	ca := &x509.Certificate{
 		SerialNumber: big.NewInt(2019),
@@ -225,3 +283,4 @@ func certsetup() (serverTLSConf *tls.Config, clientTLSConf *tls.Config, err erro
 
 	return
 }
+*/
