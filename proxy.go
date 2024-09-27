@@ -37,8 +37,22 @@ func startListener(ca cert.CertificateWithPrivate) {
 }
 func handleHTTPS(conn net.Conn, r *http.Request, ca cert.CertificateWithPrivate) {
 	host := r.URL.Host
-	//port := r.URL.Port()
 	fmt.Println(host)
+	go conn.Write([]byte("HTTP/1.0 200 Connection established\r\n\r\n"))
+
+	tlsConn2Chan := make(chan *tls.Conn)
+	go func() {
+		var d net.Dialer
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		conn2, err := d.DialContext(ctx, "tcp", r.URL.Host)
+		if err != nil {
+			log.Printf("Failed to dial: %v", err)
+			tlsConn2Chan <- nil
+		}
+		tlsConn2 := tls.Client(conn2, &tls.Config{ServerName: strings.Split(host, ":")[0]})
+		tlsConn2Chan <- tlsConn2
+	}()
 
 	hostReplaced := strings.Split(strings.ReplaceAll(r.Host, ".", "-"), ":")[0]
 	if _, err := os.Stat("certs/hosts/" + hostReplaced + ".crt"); errors.Is(err, os.ErrNotExist) {
@@ -48,40 +62,21 @@ func handleHTTPS(conn net.Conn, r *http.Request, ca cert.CertificateWithPrivate)
 		}
 	}
 	serverCert, err := tls.LoadX509KeyPair("certs/hosts/"+hostReplaced+".crt", "certs/hosts/"+hostReplaced+"-PRIVATE.key")
-
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
 	config := &tls.Config{
 		Certificates: []tls.Certificate{serverCert},
 	}
-	go conn.Write([]byte("HTTP/1.0 200 Connection established\r\n\r\n"))
+
 	tlsConn := tls.Server(conn, config)
-	reader := bufio.NewReader(tlsConn)
-	requestFromClient, err := http.ReadRequest(reader)
+	/*reader := bufio.NewReader(tlsConn)
+	requestFromClient, err := http.ReadRequest(reader)*/
 
-	var d net.Dialer
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-
-	conn2, err := d.DialContext(ctx, "tcp", r.URL.Host)
-	tlsConn2 := tls.Client(conn2, &tls.Config{ServerName: strings.Split(host, ":")[0]})
-
-	if err != nil {
-		log.Printf("Failed to dial: %v", err)
-	}
-	defer func(conn2 net.Conn) {
-		err := conn2.Close()
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-	}(conn2)
-	if requestFromClient != nil {
-		err = requestFromClient.Write(tlsConn2)
-		if err != nil {
-			log.Println(err)
-			return
-		}
-		io.Copy(tlsConn, tlsConn2)
-	}
+	tlsConn2 := <-tlsConn2Chan
+	go io.Copy(tlsConn2, tlsConn)
+	io.Copy(tlsConn, tlsConn2)
 
 	/*r.Write(conn2)
 	reader2 := bufio.NewReader(conn2)
