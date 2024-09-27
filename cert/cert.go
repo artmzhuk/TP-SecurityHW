@@ -112,15 +112,17 @@ func OpenCert(path string) (CertificateWithPrivate, error) {
 }
 
 func CreateCert(host string, ca CertificateWithPrivate, folder string) (CertificateWithPrivate, error) {
+	hostWithDot := strings.ReplaceAll(host, "-", ".")
 	cert := &x509.Certificate{
 		SerialNumber: big.NewInt(2024),
 		Subject: pkix.Name{
-			CommonName: strings.ReplaceAll(host, "-", "."),
+			CommonName: hostWithDot,
 		},
 		NotBefore:   time.Now(),
 		NotAfter:    time.Now().AddDate(10, 0, 0),
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
 		KeyUsage:    x509.KeyUsageDigitalSignature,
+		DNSNames:    []string{hostWithDot, "*." + hostWithDot},
 	}
 
 	certPrivKey, err := rsa.GenerateKey(rand.Reader, 4096)

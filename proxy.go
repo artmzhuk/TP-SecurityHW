@@ -52,7 +52,7 @@ func handleHTTPS(conn net.Conn, r *http.Request, ca cert.CertificateWithPrivate)
 	config := &tls.Config{
 		Certificates: []tls.Certificate{serverCert},
 	}
-	conn.Write([]byte("HTTP/1.0 200 Connection established\r\n\r\n"))
+	go conn.Write([]byte("HTTP/1.0 200 Connection established\r\n\r\n"))
 	tlsConn := tls.Server(conn, config)
 	reader := bufio.NewReader(tlsConn)
 	requestFromClient, err := http.ReadRequest(reader)
@@ -60,18 +60,28 @@ func handleHTTPS(conn net.Conn, r *http.Request, ca cert.CertificateWithPrivate)
 	var d net.Dialer
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
+
 	conn2, err := d.DialContext(ctx, "tcp", r.URL.Host)
+	tlsConn2 := tls.Client(conn2, &tls.Config{ServerName: strings.Split(host, ":")[0]})
 
 	if err != nil {
 		log.Printf("Failed to dial: %v", err)
 	}
-	defer conn2.Close()
-	err = requestFromClient.Write(conn2)
-	if err != nil {
-		log.Println(err)
-		return
+	defer func(conn2 net.Conn) {
+		err := conn2.Close()
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+	}(conn2)
+	if requestFromClient != nil {
+		err = requestFromClient.Write(tlsConn2)
+		if err != nil {
+			log.Println(err)
+			return
+		}
+		io.Copy(tlsConn, tlsConn2)
 	}
-	io.Copy(tlsConn, conn2)
 
 	/*r.Write(conn2)
 	reader2 := bufio.NewReader(conn2)
@@ -84,7 +94,13 @@ func handleHTTPS(conn net.Conn, r *http.Request, ca cert.CertificateWithPrivate)
 }
 
 func handleConnection(conn net.Conn, ca cert.CertificateWithPrivate) {
-	defer conn.Close()
+	defer func(conn net.Conn) {
+		err := conn.Close()
+		if err != nil {
+			log.Println(err)
+			return
+		}
+	}(conn)
 	reader := bufio.NewReader(conn)
 	request, err := http.ReadRequest(reader)
 	if err != nil {
