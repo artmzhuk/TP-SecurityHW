@@ -3,6 +3,7 @@ package main
 import (
 	"Proxy/cert"
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -23,21 +24,61 @@ func startListener(ca cert.CertificateWithPrivate) {
 	}
 	defer listener.Close()
 	for {
-		// Wait for a connection.
 		conn, err := listener.Accept()
 		if err != nil {
 			log.Println(err)
 			return
 		}
-		// Handle the connection in a new goroutine.
-		// The loop then returns to accepting, so that
-		// multiple connections may be served concurrently.
-		go handleConnection(conn, ca)
+
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Println("Recovered", r)
+				}
+			}()
+			handleConnection(conn, ca)
+		}()
 	}
 }
+
+type copyWrap struct {
+	conn *tls.Conn
+	buf  *bytes.Buffer
+}
+
+func (wrap copyWrap) Write(p []byte) (n int, err error) {
+	write, err := wrap.conn.Write(p)
+	if err != nil {
+		return write, err
+	}
+	wrap.buf.Write(p)
+	return write, nil
+}
+
+func (wrap copyWrap) FindRequest() *http.Request {
+	reader := bufio.NewReader(wrap.buf)
+	request, err := http.ReadRequest(reader)
+	if err != nil {
+		fmt.Println(err, "in find req")
+		return nil
+	}
+	//fmt.Println("FOUND", request.RequestURI)
+	return request
+}
+
+func (wrap copyWrap) FindResponse(r *http.Request) {
+	reader := bufio.NewReader(wrap.buf)
+	response, err := http.ReadResponse(reader, r)
+	if err != nil {
+		fmt.Println(err, "in find resp")
+		return
+	}
+	fmt.Println("FOUND", response.Request.Host)
+}
+
 func handleHTTPS(conn net.Conn, r *http.Request, ca cert.CertificateWithPrivate) {
 	host := r.URL.Host
-	fmt.Println(host)
+	fmt.Println(host, r.Method)
 	go conn.Write([]byte("HTTP/1.0 200 Connection established\r\n\r\n"))
 
 	tlsConn2Chan := make(chan *tls.Conn)
@@ -71,20 +112,24 @@ func handleHTTPS(conn net.Conn, r *http.Request, ca cert.CertificateWithPrivate)
 	}
 
 	tlsConn := tls.Server(conn, config)
-	/*reader := bufio.NewReader(tlsConn)
-	requestFromClient, err := http.ReadRequest(reader)*/
 
 	tlsConn2 := <-tlsConn2Chan
-	go io.Copy(tlsConn2, tlsConn)
-	io.Copy(tlsConn, tlsConn2)
-
-	/*r.Write(conn2)
-	reader2 := bufio.NewReader(conn2)
-	if err != nil {
-		return
+	buf1 := copyWrap{
+		conn: tlsConn,
+		buf:  new(bytes.Buffer),
 	}
-	resp, _ := io.ReadAll(reader2)
-	fmt.Println(string(resp))*/
+	buf2 := copyWrap{
+		conn: tlsConn2,
+		buf:  new(bytes.Buffer),
+	}
+	reqChan := make(chan *http.Request)
+	go func() {
+		io.Copy(buf2, tlsConn)
+		reqChan <- buf2.FindRequest()
+
+	}()
+	io.Copy(buf1, tlsConn2)
+	buf1.FindResponse(<-reqChan)
 	return
 }
 
@@ -147,10 +192,6 @@ func main() {
 			return
 		}
 	}
-	/*	_, err := cert.CreateCert("mail.ru", ca, "certs/hosts")
-		if err != nil {
-			fmt.Println(err)
-			return
-		}*/
+	//initDB()
 	startListener(ca)
 }
