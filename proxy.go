@@ -55,30 +55,44 @@ func (wrap copyWrap) Write(p []byte) (n int, err error) {
 	return write, nil
 }
 
-func (wrap copyWrap) FindRequest() *http.Request {
+func (wrap copyWrap) FindRequest() []*http.Request {
 	reader := bufio.NewReader(wrap.buf)
-	request, err := http.ReadRequest(reader)
-	if err != nil {
-		fmt.Println(err, "in find req")
-		return nil
+	res := make([]*http.Request, 0)
+	for {
+		request, err := http.ReadRequest(reader)
+		if err != nil {
+			if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+				//fmt.Println(err, "in find req")
+				return res
+			} else {
+				fmt.Println()
+			}
+		}
+		res = append(res, request)
+		fmt.Println(request.RequestURI)
 	}
-	//fmt.Println("FOUND", request.RequestURI)
-	return request
 }
 
-func (wrap copyWrap) FindResponse(r *http.Request) {
+func (wrap copyWrap) FindResponse(reqs []*http.Request) []*http.Response {
 	reader := bufio.NewReader(wrap.buf)
-	response, err := http.ReadResponse(reader, r)
-	if err != nil {
-		fmt.Println(err, "in find resp")
-		return
+	res := make([]*http.Response, 0)
+	for {
+		response, err := http.ReadResponse(reader, nil)
+		if err != nil {
+			if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+				if len(res) != len(reqs) {
+					panic("hz")
+				}
+				return res
+			}
+		}
+		res = append(res, response)
 	}
-	fmt.Println("FOUND", response.Request.Host)
 }
 
 func handleHTTPS(conn net.Conn, r *http.Request, ca cert.CertificateWithPrivate) {
 	host := r.URL.Host
-	fmt.Println(host, r.Method)
+	//fmt.Println(host, r.Method)
 	go conn.Write([]byte("HTTP/1.0 200 Connection established\r\n\r\n"))
 
 	tlsConn2Chan := make(chan *tls.Conn)
@@ -122,14 +136,13 @@ func handleHTTPS(conn net.Conn, r *http.Request, ca cert.CertificateWithPrivate)
 		conn: tlsConn2,
 		buf:  new(bytes.Buffer),
 	}
-	reqChan := make(chan *http.Request)
+	reqResChan := make(chan []*http.Request)
 	go func() {
 		io.Copy(buf2, tlsConn)
-		reqChan <- buf2.FindRequest()
-
+		reqResChan <- buf2.FindRequest()
 	}()
 	io.Copy(buf1, tlsConn2)
-	buf1.FindResponse(<-reqChan)
+	buf1.FindResponse(<-reqResChan)
 	return
 }
 
