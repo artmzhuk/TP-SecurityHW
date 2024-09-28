@@ -2,10 +2,12 @@ package main
 
 import (
 	"Proxy/cert"
+	dbPackage "Proxy/db"
 	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -14,10 +16,11 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
-func startListener(ca cert.CertificateWithPrivate) {
+func startListener(ca cert.CertificateWithPrivate, db *sql.DB) {
 	listener, err := net.Listen("tcp", ":8080")
 	if err != nil {
 		log.Fatal(err)
@@ -36,17 +39,25 @@ func startListener(ca cert.CertificateWithPrivate) {
 					fmt.Println("Recovered", r)
 				}
 			}()
-			handleConnection(conn, ca)
+			handleConnection(conn, ca, db)
 		}()
 	}
+}
+
+type requestResponsePair struct {
+	Request  *http.Request
+	Response *http.Response
 }
 
 type copyWrap struct {
 	conn *tls.Conn
 	buf  *bytes.Buffer
+	mu   sync.Mutex
 }
 
-func (wrap copyWrap) Write(p []byte) (n int, err error) {
+func (wrap *copyWrap) Write(p []byte) (n int, err error) {
+	wrap.mu.Lock()
+	defer wrap.mu.Unlock()
 	write, err := wrap.conn.Write(p)
 	if err != nil {
 		return write, err
@@ -55,44 +66,26 @@ func (wrap copyWrap) Write(p []byte) (n int, err error) {
 	return write, nil
 }
 
-func (wrap copyWrap) FindRequest() []*http.Request {
+func (wrap *copyWrap) FindRequest() *http.Request {
 	reader := bufio.NewReader(wrap.buf)
-	res := make([]*http.Request, 0)
-	for {
-		request, err := http.ReadRequest(reader)
-		if err != nil {
-			if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
-				//fmt.Println(err, "in find req")
-				return res
-			} else {
-				fmt.Println()
-			}
-		}
-		res = append(res, request)
-		fmt.Println(request.RequestURI)
+	request, err := http.ReadRequest(reader)
+	if err != nil {
+		return nil
 	}
+	return request
 }
 
-func (wrap copyWrap) FindResponse(reqs []*http.Request) []*http.Response {
+func (wrap *copyWrap) FindResponse() *http.Response {
 	reader := bufio.NewReader(wrap.buf)
-	res := make([]*http.Response, 0)
-	for {
-		response, err := http.ReadResponse(reader, nil)
-		if err != nil {
-			if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
-				if len(res) != len(reqs) {
-					panic("hz")
-				}
-				return res
-			}
-		}
-		res = append(res, response)
+	response, err := http.ReadResponse(reader, nil)
+	if err != nil {
+		return nil
 	}
+	return response
 }
 
-func handleHTTPS(conn net.Conn, r *http.Request, ca cert.CertificateWithPrivate) {
+func handleHTTPS(conn net.Conn, r *http.Request, ca cert.CertificateWithPrivate, db *sql.DB) {
 	host := r.URL.Host
-	//fmt.Println(host, r.Method)
 	go conn.Write([]byte("HTTP/1.0 200 Connection established\r\n\r\n"))
 
 	tlsConn2Chan := make(chan *tls.Conn)
@@ -104,6 +97,7 @@ func handleHTTPS(conn net.Conn, r *http.Request, ca cert.CertificateWithPrivate)
 		if err != nil {
 			log.Printf("Failed to dial: %v", err)
 			tlsConn2Chan <- nil
+			return
 		}
 		tlsConn2 := tls.Client(conn2, &tls.Config{ServerName: strings.Split(host, ":")[0]})
 		tlsConn2Chan <- tlsConn2
@@ -116,6 +110,7 @@ func handleHTTPS(conn net.Conn, r *http.Request, ca cert.CertificateWithPrivate)
 			return
 		}
 	}
+
 	serverCert, err := tls.LoadX509KeyPair("certs/hosts/"+hostReplaced+".crt", "certs/hosts/"+hostReplaced+"-PRIVATE.key")
 	if err != nil {
 		fmt.Println(err)
@@ -126,27 +121,54 @@ func handleHTTPS(conn net.Conn, r *http.Request, ca cert.CertificateWithPrivate)
 	}
 
 	tlsConn := tls.Server(conn, config)
-
 	tlsConn2 := <-tlsConn2Chan
-	buf1 := copyWrap{
+
+	if tlsConn2 == nil {
+		log.Println("Failed to establish TLS connection with server.")
+		return
+	}
+
+	buf1 := &copyWrap{
 		conn: tlsConn,
 		buf:  new(bytes.Buffer),
 	}
-	buf2 := copyWrap{
+	buf2 := &copyWrap{
 		conn: tlsConn2,
 		buf:  new(bytes.Buffer),
 	}
-	reqResChan := make(chan []*http.Request)
+
+	reqResChan := make(chan *requestResponsePair)
+
 	go func() {
 		io.Copy(buf2, tlsConn)
-		reqResChan <- buf2.FindRequest()
+		for {
+			request := buf2.FindRequest()
+			if request == nil {
+				break
+			}
+			response := buf1.FindResponse()
+			reqResChan <- &requestResponsePair{Request: request, Response: response}
+		}
+		close(reqResChan)
+	}()
+
+	go func() {
+		for reqRes := range reqResChan {
+			if reqRes.Request != nil && reqRes.Response != nil {
+				reqID := make(chan int)
+				go dbPackage.StoreRequest(db, reqRes.Request, reqID)
+				go dbPackage.StoreResponse(db, reqID, reqRes.Response)
+				fmt.Printf("Matched Request: %v with Response: %v\n", reqRes.Request.RequestURI, reqRes.Response.Status)
+			}
+		}
 	}()
 	io.Copy(buf1, tlsConn2)
-	buf1.FindResponse(<-reqResChan)
-	return
+	tlsConn.Close()
+	tlsConn2.Close()
 }
 
-func handleConnection(conn net.Conn, ca cert.CertificateWithPrivate) {
+// Handle TCP connection
+func handleConnection(conn net.Conn, ca cert.CertificateWithPrivate, db *sql.DB) {
 	defer func(conn net.Conn) {
 		err := conn.Close()
 		if err != nil {
@@ -161,7 +183,7 @@ func handleConnection(conn net.Conn, ca cert.CertificateWithPrivate) {
 		return
 	}
 	if request.Method == "CONNECT" {
-		handleHTTPS(conn, request, ca)
+		handleHTTPS(conn, request, ca, db)
 		return
 	}
 
@@ -205,6 +227,6 @@ func main() {
 			return
 		}
 	}
-	//initDB()
-	startListener(ca)
+	initDB := dbPackage.InitDB()
+	startListener(ca, initDB)
 }
