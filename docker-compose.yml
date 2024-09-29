@@ -24,9 +24,11 @@ services:
       POSTGRES_PASSWORD: postgres
   adminer:
     image: adminer
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
     restart: always
     ports:
-      - "8282:8282"
+      - "8000:8282"
     command:
         - 'php'
         - '-S'

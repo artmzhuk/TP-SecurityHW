@@ -163,7 +163,7 @@ func handleHTTPS(conn net.Conn, r *http.Request, ca cert.CertificateWithPrivate,
 		}
 	}()
 	io.Copy(buf1, tlsConn2)
-	tlsConn.Close()
+	//tlsConn.Close()
 	tlsConn2.Close()
 }
 
